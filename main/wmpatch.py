@@ -122,3 +122,120 @@ class GTWatermarkMulti(GTWatermark):
     #     sampled_elements = l1_tensor[indices]
     #     l1_metric = sampled_elements.mean().item()
     #     return l1_metric
+
+class KeyedGTWatermark(GTWatermark):
+    def __init__(self, device, key, shape=(1,4,64,64), dtype=torch.float32, w_channel=3, w_radius=10, generator=None):
+        super().__init__(device, shape, dtype, w_channel, w_radius, generator)
+        self.key = key
+        self.ring_stats = self._compute_ring_statistics()
+
+    def inject_watermark(self, latents):
+        """Override parent's inject_watermark to include key encoding"""
+        latents_fft = torch.fft.fftshift(torch.fft.fft2(latents), dim=(-1, -2))
+        
+        # Convert key to binary and pad to w_radius length
+        key_bits = format(self.key, 'b').zfill(self.w_radius)
+        
+        # Apply key-based watermark
+        for i, bit in enumerate(key_bits):
+            radius = i + 1
+            ring_mask = self._get_ring_mask(latents_fft.shape[-1], radius)
+            ring_mask = ring_mask.unsqueeze(0).unsqueeze(0)
+            ring_mask = ring_mask.expand(latents_fft.shape[0], 1, -1, -1)
+            
+            # Select and modify the watermark channel
+            modifier = 2.0 if bit == '1' else 0.5
+            channel_mask = torch.zeros_like(latents_fft, dtype=torch.bool)
+            channel_mask[:, self.w_channel:self.w_channel+1] = ring_mask
+            print(channel_mask)
+            
+            # Apply modification
+            latents_fft = torch.where(channel_mask, 
+                                    latents_fft * modifier, 
+                                    latents_fft)
+        
+        # Convert back to spatial domain
+        latents_w = torch.fft.ifft2(torch.fft.ifftshift(latents_fft, dim=(-1, -2))).real
+        return latents_w
+
+    def _compute_ring_statistics(self):
+        """Compute statistical thresholds for each ring"""
+        ring_stats = []
+        num_samples = 1000
+        
+        for i in range(self.w_radius):
+            ring_amplitudes = []
+            for _ in range(num_samples):
+                rand_latents = randn_tensor(self.shape, device=self.device, dtype=self.dtype)
+                rand_fft = torch.fft.fftshift(torch.fft.fft2(rand_latents), dim=(-1, -2))
+                
+                radius = i + 1
+                ring_mask = self._get_ring_mask(rand_fft.shape[-1], radius)
+                ring_amp = torch.abs(rand_fft[:, self.w_channel, ring_mask]).mean().item()
+                ring_amplitudes.append(ring_amp)
+            
+            stats = {
+                'mean': np.mean(ring_amplitudes),
+                'std': np.std(ring_amplitudes),
+                'threshold': np.mean(ring_amplitudes) * 1.5
+            }
+            ring_stats.append(stats)
+        print(ring_stats)
+        return ring_stats
+
+    def _get_ring_mask(self, size, radius):
+        """Get mask for a specific ring"""
+        outer = self._circle_mask(size, r=radius)
+        inner = self._circle_mask(size, r=radius-1)
+        return torch.tensor(np.logical_xor(outer, inner)).to(self.device)
+
+    def _detect_key(self, latents):
+        latents_fft = torch.fft.fftshift(torch.fft.fft2(latents), dim=(-1, -2))
+        detected_bits = []
+        confidence_scores = []
+
+        for i in range(self.w_radius):
+            radius = i + 1
+            ring_mask = self._get_ring_mask(latents_fft.shape[-1], radius)
+            
+            # Expand mask to match tensor dimensions
+            ring_mask = ring_mask.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+            ring_mask = ring_mask.expand(latents_fft.shape[0], 1, -1, -1)
+            
+            # Select the watermark channel and apply mask
+            channel_data = latents_fft[:, self.w_channel:self.w_channel+1]
+            masked_data = channel_data[ring_mask]
+
+            print(masked_data)
+            
+            # Calculate amplitude
+            ring_amplitude = torch.abs(masked_data).mean().item()
+            normalized_amp = (ring_amplitude - self.ring_stats[i]['mean']) / self.ring_stats[i]['std']
+            print(ring_amplitude, normalized_amp)
+            
+            bit = '1' if normalized_amp > 1.5 else '0'
+            confidence = abs(normalized_amp)
+            
+            detected_bits.append(bit)
+            confidence_scores.append(confidence)
+
+        # Apply confidence threshold
+        reliable_bits = [b if c > 2.0 else '0' for b, c in zip(detected_bits, confidence_scores)]
+        return int(''.join(reliable_bits), 2)
+
+    def evaluate_key_detection(self, latents):
+        """Evaluate key detection with confidence metrics"""
+        detected_key = self._detect_key(latents)
+        watermark_prob = 1 - self.tree_ring_p_value(latents)
+        
+        # Compare with original key
+        original_bits = format(self.key, 'b').zfill(self.w_radius)
+        detected_bits = format(detected_key, 'b').zfill(self.w_radius)
+        bit_accuracy = sum(a == b for a, b in zip(original_bits, detected_bits)) / len(original_bits)
+        
+        return {
+            'detected_key': detected_key,
+            'watermark_probability': watermark_prob,
+            'bit_accuracy': bit_accuracy,
+            'confidence': bit_accuracy * watermark_prob
+        }

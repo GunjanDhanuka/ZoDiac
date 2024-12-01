@@ -111,3 +111,44 @@ def watermark_prob(img, dect_pipe, wm_pipe, text_embeddings, tree_ring=True, dev
     )
     det_prob = wm_pipe.one_minus_p_value(reversed_latents) if not tree_ring else wm_pipe.tree_ring_p_value(reversed_latents)
     return det_prob
+
+def detect_keyed_watermark(img, dect_pipe, wm_pipe, text_embeddings, device=torch.device('cuda')):
+    """
+    Detect watermark key and detailed metrics from an image.
+    
+    Args:
+        img: String path to image or torch tensor
+        dect_pipe: Detection pipeline
+        wm_pipe: KeyedGTWatermark pipeline
+        text_embeddings: Text embeddings for diffusion
+        device: Computation device
+    
+    Returns:
+        dict: Detection results containing:
+            - detected_key: The extracted watermark key
+            - watermark_probability: Probability of watermark presence
+            - bit_accuracy: Accuracy of key bit detection
+            - confidence: Overall detection confidence
+    """
+    # Convert image to tensor if needed
+    if isinstance(img, str):
+        img_tensor = pil_to_tensor(Image.open(img).convert("RGB"))/255
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+    elif isinstance(img, torch.Tensor):
+        img_tensor = img
+
+    # Get latents through detection pipeline
+    img_latents = dect_pipe.get_image_latents(img_tensor, sample=False)
+    
+    # Reverse diffusion process
+    reversed_latents = dect_pipe.forward_diffusion(
+        latents=img_latents,
+        text_embeddings=text_embeddings,
+        guidance_scale=1.0,
+        num_inference_steps=50,
+    )
+    
+    # Get detailed evaluation metrics
+    detection_results = wm_pipe.evaluate_key_detection(reversed_latents)
+    
+    return detection_results
